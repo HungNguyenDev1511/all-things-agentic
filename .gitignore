@@ -1,0 +1,28 @@
+# Python environment
+.venv/
+venv/
+
+# Python cache
+__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Secrets / environment
+.env
+**/.env
+
+# ADK runtime data
+.adk/
+**/.adk/
+
+# Generated migration outputs
+migration_output/
+
+# IDE
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
