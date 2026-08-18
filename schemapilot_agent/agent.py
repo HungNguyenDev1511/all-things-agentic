@@ -202,9 +202,7 @@ def open_csv_auto(file_path: str):
 # IDEMPOTENCY / MIGRATION LEDGER
 # ============================================================
 
-PROJECT_ROOT = os.path.dirname(
-    os.path.dirname(__file__)
-)
+PROJECT_ROOT = os.path.dirname(__file__)
 
 RUNTIME_DIR = os.path.join(
     os.path.dirname(__file__),
@@ -374,14 +372,22 @@ def _make_row_idempotency_key(
 
 
 def normalize_input(node_input: str):
-    """Validate the input path and persist it for downstream nodes."""
-    file_path = str(node_input).strip().strip('"').strip("'")
-    file_path = os.path.abspath(file_path)
+    raw_input = str(node_input).strip().strip('"').strip("'")
+
+    # Cloud demo mode
+    if raw_input.upper() == "RUN_DEMO":
+        file_path = os.path.join(
+            os.path.dirname(__file__),
+            "sample_data",
+            "employees.csv",
+        )
+    else:
+        file_path = os.path.abspath(raw_input)
 
     if not os.path.exists(file_path):
         return Event(
             output={
-                "error": f"File not found: {file_path}",
+                "error": f"File not found: {file_path}"
             },
             message=f"File not found: {file_path}",
         )
