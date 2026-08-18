@@ -7,12 +7,7 @@ from google.adk import Agent
 MODEL = "gemini-3.5-flash"
 
 AGENT_ROOT = Path(__file__).resolve().parent
-
-ORG_MASTER_PATH = (
-    AGENT_ROOT
-    / "sample_data"
-    / "organization_master.csv"
-)
+ORG_MASTER_PATH = AGENT_ROOT / "sample_data" / "organization_master.csv"
 
 
 def get_organization_master() -> dict:

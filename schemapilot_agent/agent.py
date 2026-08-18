@@ -372,9 +372,9 @@ def _make_row_idempotency_key(
 
 
 def normalize_input(node_input: str):
+    """Validate the input path and support a packaged Cloud Run demo."""
     raw_input = str(node_input).strip().strip('"').strip("'")
 
-    # Cloud demo mode
     if raw_input.upper() == "RUN_DEMO":
         file_path = os.path.join(
             os.path.dirname(__file__),
@@ -387,7 +387,7 @@ def normalize_input(node_input: str):
     if not os.path.exists(file_path):
         return Event(
             output={
-                "error": f"File not found: {file_path}"
+                "error": f"File not found: {file_path}",
             },
             message=f"File not found: {file_path}",
         )
@@ -398,7 +398,6 @@ def normalize_input(node_input: str):
             "source_file_path": file_path,
         },
     )
-
 
 def scan_schema(node_input: str):
     """Inspect input columns."""
@@ -536,9 +535,7 @@ def prepare_mapping_input(
     """
     profile_results = node_input
 
-    project_root = os.path.dirname(
-        os.path.dirname(__file__)
-    )
+    project_root = os.path.dirname(__file__)
 
     target_schema_path = os.path.join(
         project_root,
@@ -1690,9 +1687,7 @@ def verify_migration(node_input: dict):
     - Migration success additionally requires at least one migrated row and
       valid migrated output.
     """
-    project_root = os.path.dirname(
-        os.path.dirname(__file__)
-    )
+    project_root = os.path.dirname(__file__)
 
     # A structural parser/schema error is fatal and must never be reported as
     # MIGRATION_COMPLETED.
