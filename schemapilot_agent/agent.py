@@ -1,9 +1,12 @@
 import csv
+import hashlib
+import io
 import json
 import os
 import re
-from datetime import datetime
-import io
+import sqlite3
+import tempfile
+from datetime import datetime, timezone
 
 from google.adk import Event, Workflow
 from google.adk.events import RequestInput
@@ -24,6 +27,7 @@ EXPECTED_COLUMNS = {
 
 
 def _normalize_header(value: str) -> str:
+    """Normalize CSV headers without changing business values."""
     return str(value or "").replace("\ufeff", "").strip()
 
 
@@ -34,16 +38,14 @@ def open_csv_auto(file_path: str):
     Handles:
     - UTF-8 / UTF-8 BOM / cp1258
     - comma / tab / semicolon / pipe
-    - malformed files where the ENTIRE row is wrapped in quotes,
-      e.g. "EMP_CODE<TAB>FULL_NAME<TAB>DOB<TAB>DEPARTMENT"
+    - malformed exports where the ENTIRE row is wrapped in quotes, for example:
+      "EMP_CODE<TAB>FULL_NAME<TAB>DOB<TAB>DEPARTMENT"
     """
-
     encodings = [
         "utf-8-sig",
         "utf-8",
         "cp1258",
     ]
-
     delimiters = [
         ",",
         "\t",
@@ -69,7 +71,6 @@ def open_csv_auto(file_path: str):
                 )
 
             lines = content.splitlines()
-
             non_empty_lines = [
                 line
                 for line in lines
@@ -81,21 +82,15 @@ def open_csv_auto(file_path: str):
                     f"Empty source file: {file_path}"
                 )
 
-            # ------------------------------------------------
-            # Fix legacy malformed format:
-            #
-            # "EMP_CODE<TAB>FULL_NAME<TAB>DOB<TAB>DEPARTMENT"
-            #
-            # Entire row is quoted, so csv module would treat
-            # the whole row as one field.
-            # ------------------------------------------------
-
             first_line = non_empty_lines[0]
 
             whole_row_quoted = (
                 first_line.startswith('"')
                 and first_line.endswith('"')
-                and "\t" in first_line
+                and any(
+                    delimiter in first_line
+                    for delimiter in delimiters
+                )
             )
 
             if whole_row_quoted:
@@ -110,19 +105,14 @@ def open_csv_auto(file_path: str):
                     ):
                         stripped = stripped[1:-1]
 
-                    # Restore escaped quotes if they exist
                     stripped = stripped.replace(
                         '""',
-                        '"'
+                        '"',
                     )
 
                     cleaned_lines.append(stripped)
 
                 content = "\n".join(cleaned_lines)
-
-            # ------------------------------------------------
-            # Detect delimiter
-            # ------------------------------------------------
 
             header_line = next(
                 line
@@ -135,7 +125,6 @@ def open_csv_auto(file_path: str):
             best_score = -1
 
             for delimiter in delimiters:
-
                 parsed_header = next(
                     csv.reader(
                         [header_line],
@@ -159,9 +148,12 @@ def open_csv_auto(file_path: str):
                     best_delimiter = delimiter
                     best_headers = headers
 
-            # ------------------------------------------------
-            # Build DictReader
-            # ------------------------------------------------
+            if best_score <= 0:
+                dialect = csv.Sniffer().sniff(
+                    content[:4096],
+                    delimiters=",;\t|",
+                )
+                best_delimiter = dialect.delimiter
 
             stream = io.StringIO(content)
 
@@ -196,9 +188,7 @@ def open_csv_auto(file_path: str):
             csv.Error,
             ValueError,
         ) as exc:
-
             last_error = exc
-
             continue
 
     raise ValueError(
@@ -206,6 +196,182 @@ def open_csv_auto(file_path: str):
         f"{file_path}. "
         f"Last error: {last_error}"
     )
+
+
+# ============================================================
+# IDEMPOTENCY / MIGRATION LEDGER
+# ============================================================
+
+PROJECT_ROOT = os.path.dirname(
+    os.path.dirname(__file__)
+)
+
+RUNTIME_DIR = os.path.join(
+    os.path.dirname(__file__),
+    ".adk",
+)
+
+MIGRATION_LEDGER_PATH = os.path.join(
+    RUNTIME_DIR,
+    "migration_ledger.db",
+)
+
+
+def _utc_now() -> str:
+    return datetime.now(
+        timezone.utc
+    ).isoformat()
+
+
+def _file_sha256(file_path: str) -> str:
+    digest = hashlib.sha256()
+
+    with open(file_path, "rb") as f:
+        for chunk in iter(
+            lambda: f.read(1024 * 1024),
+            b"",
+        ):
+            digest.update(chunk)
+
+    return digest.hexdigest()
+
+
+def _build_migration_job_id(
+    source_file_path: str,
+    date_policy: str,
+):
+    """
+    A migration job is uniquely determined by:
+    - source file bytes
+    - target schema bytes
+    - organization master bytes
+    - human-approved date policy
+    - workflow version
+
+    Re-running the exact same migration produces the same job id.
+    """
+    target_schema_path = os.path.join(
+        PROJECT_ROOT,
+        "sample_data",
+        "target_schema.json",
+    )
+
+    org_master_path = os.path.join(
+        PROJECT_ROOT,
+        "sample_data",
+        "organization_master.csv",
+    )
+
+    fingerprints = {
+        "source_sha256":
+            _file_sha256(source_file_path),
+        "target_schema_sha256":
+            _file_sha256(target_schema_path),
+        "organization_master_sha256":
+            _file_sha256(org_master_path),
+        "date_policy":
+            date_policy,
+        "workflow_version":
+            "schemapilot-v2-idempotent",
+    }
+
+    canonical = json.dumps(
+        fingerprints,
+        sort_keys=True,
+        ensure_ascii=False,
+    )
+
+    job_id = hashlib.sha256(
+        canonical.encode("utf-8")
+    ).hexdigest()[:24]
+
+    return job_id, fingerprints
+
+
+def _ensure_ledger_schema(conn):
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS migration_jobs (
+            job_id TEXT PRIMARY KEY,
+            status TEXT NOT NULL,
+            source_file TEXT NOT NULL,
+            source_sha256 TEXT NOT NULL,
+            date_policy TEXT NOT NULL,
+            migrated_output_path TEXT,
+            rejected_output_path TEXT,
+            report_path TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS migration_rows (
+            idempotency_key TEXT PRIMARY KEY,
+            job_id TEXT NOT NULL,
+            source_row INTEGER NOT NULL,
+            emp_code TEXT,
+            result_type TEXT NOT NULL,
+            payload_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(job_id)
+                REFERENCES migration_jobs(job_id)
+        )
+        """
+    )
+
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS
+        idx_migration_rows_job_id
+        ON migration_rows(job_id)
+        """
+    )
+
+
+def _open_ledger():
+    os.makedirs(
+        RUNTIME_DIR,
+        exist_ok=True,
+    )
+
+    conn = sqlite3.connect(
+        MIGRATION_LEDGER_PATH,
+        timeout=30,
+    )
+
+    conn.execute(
+        "PRAGMA journal_mode=WAL"
+    )
+    conn.execute(
+        "PRAGMA foreign_keys=ON"
+    )
+
+    _ensure_ledger_schema(conn)
+
+    return conn
+
+
+def _make_row_idempotency_key(
+    job_id: str,
+    source_row: int,
+    emp_code: str,
+    result_type: str,
+) -> str:
+    raw = (
+        f"{job_id}|"
+        f"{source_row}|"
+        f"{emp_code}|"
+        f"{result_type}"
+    )
+
+    return hashlib.sha256(
+        raw.encode("utf-8")
+    ).hexdigest()
+
+
 
 def normalize_input(node_input: str):
     """Validate the input path and persist it for downstream nodes."""
@@ -867,59 +1033,107 @@ def transform_records(
     source_file_path: str,
 ):
     """
-    Transform the source file into target employee rows.
+    Transform source rows deterministically and assign stable idempotency keys.
 
-    Rules:
-    - Duplicate EMP_CODE after the first occurrence is rejected.
-    - Unresolved organizations are rejected.
-    - Invalid dates are rejected.
-    - Ambiguous dates use the human-approved policy.
-    - Output schema: employee_code, full_name, date_of_birth, org_id.
+    The node itself has no external side effects. If ADK re-runs it during
+    resume/retry, the same input produces the same job id and row keys.
     """
-    context = node_input.get("migration_context", {})
-    mapping = context.get("mapping", {})
-    date_policy = node_input.get("date_policy", "AUTO_SAFE_ONLY")
+    context = node_input.get(
+        "migration_context",
+        {},
+    )
+    mapping = context.get(
+        "mapping",
+        {},
+    )
+    date_policy = node_input.get(
+        "date_policy",
+        "AUTO_SAFE_ONLY",
+    )
+
+    job_id, fingerprints = (
+        _build_migration_job_id(
+            source_file_path,
+            date_policy,
+        )
+    )
 
     org_lookup = {}
-    for item in mapping.get("organization_mappings", []):
-        source_value = str(item.get("source_value") or "").strip()
+
+    for item in mapping.get(
+        "organization_mappings",
+        [],
+    ):
+        source_value = str(
+            item.get("source_value") or ""
+        ).strip()
+
         if source_value:
             org_lookup[source_value] = item
 
     date_assessment_lookup = {}
-    for item in mapping.get("date_assessments", []):
-        source_value = str(item.get("source_value") or "").strip()
+
+    for item in mapping.get(
+        "date_assessments",
+        [],
+    ):
+        source_value = str(
+            item.get("source_value") or ""
+        ).strip()
+
         if source_value:
-            date_assessment_lookup[source_value] = item
+            date_assessment_lookup[
+                source_value
+            ] = item
 
     migrated_rows = []
     rejected_rows = []
+    row_ledger_entries = []
     seen_employee_codes = set()
 
-    f, reader, file_info = open_csv_auto(source_file_path)
+    f, reader, file_info = open_csv_auto(
+        source_file_path
+    )
 
-    detected_columns = set(reader.fieldnames or [])
+    detected_columns = set(
+        reader.fieldnames or []
+    )
+
     missing_source_columns = sorted(
-        EXPECTED_COLUMNS - detected_columns
+        EXPECTED_COLUMNS
+        - detected_columns
     )
 
     if missing_source_columns:
         f.close()
 
         result = {
-            "status": "SOURCE_SCHEMA_ERROR",
-            "date_policy": date_policy,
-            "source_file": source_file_path,
-            "source_file_info": file_info,
-            "missing_source_columns": missing_source_columns,
+            "status":
+                "SOURCE_SCHEMA_ERROR",
+            "migration_job_id":
+                job_id,
+            "input_fingerprints":
+                fingerprints,
+            "date_policy":
+                date_policy,
+            "source_file":
+                source_file_path,
+            "source_file_info":
+                file_info,
+            "missing_source_columns":
+                missing_source_columns,
             "source_row_count": 0,
             "migrated_row_count": 0,
             "rejected_row_count": 0,
             "migrated_rows": [],
             "rejected_rows": [],
+            "row_ledger_entries": [],
             "fatal_error": (
-                "Source file could not be parsed into the expected columns. "
-                "Migration was stopped instead of silently rejecting every row."
+                "Source file could not be "
+                "parsed into the expected "
+                "columns. Migration was "
+                "stopped instead of silently "
+                "rejecting every row."
             ),
         }
 
@@ -933,162 +1147,532 @@ def transform_records(
         )
 
     with f:
-        for row_number, row in enumerate(reader, start=2):
-            emp_code = (row.get("EMP_CODE") or "").strip()
-            full_name = (row.get("FULL_NAME") or "").strip()
-            dob = (row.get("DOB") or "").strip()
-            department = (row.get("DEPARTMENT") or "").strip()
+        for row_number, row in enumerate(
+            reader,
+            start=2,
+        ):
+            emp_code = (
+                row.get("EMP_CODE") or ""
+            ).strip()
+
+            full_name = (
+                row.get("FULL_NAME") or ""
+            ).strip()
+
+            dob = (
+                row.get("DOB") or ""
+            ).strip()
+
+            department = (
+                row.get("DEPARTMENT")
+                or ""
+            ).strip()
 
             reasons = []
 
             if not emp_code:
-                reasons.append("MISSING_EMP_CODE")
-            elif emp_code in seen_employee_codes:
-                reasons.append("DUPLICATE_EMP_CODE")
+                reasons.append(
+                    "MISSING_EMP_CODE"
+                )
+            elif (
+                emp_code
+                in seen_employee_codes
+            ):
+                reasons.append(
+                    "DUPLICATE_EMP_CODE"
+                )
             else:
-                seen_employee_codes.add(emp_code)
+                seen_employee_codes.add(
+                    emp_code
+                )
 
             if not full_name:
-                reasons.append("MISSING_FULL_NAME")
+                reasons.append(
+                    "MISSING_FULL_NAME"
+                )
 
-            org_mapping = org_lookup.get(department)
+            org_mapping = org_lookup.get(
+                department
+            )
             org_id = None
 
             if not department:
-                reasons.append("MISSING_DEPARTMENT")
+                reasons.append(
+                    "MISSING_DEPARTMENT"
+                )
             elif not org_mapping:
-                reasons.append("ORG_MAPPING_NOT_FOUND")
-            elif org_mapping.get("status") != "AUTO":
-                reasons.append("ORG_MAPPING_REQUIRES_REVIEW")
-            elif org_mapping.get("org_id") is None:
-                reasons.append("ORG_ID_MISSING")
+                reasons.append(
+                    "ORG_MAPPING_NOT_FOUND"
+                )
+            elif (
+                org_mapping.get("status")
+                != "AUTO"
+            ):
+                reasons.append(
+                    "ORG_MAPPING_REQUIRES_REVIEW"
+                )
+            elif (
+                org_mapping.get("org_id")
+                is None
+            ):
+                reasons.append(
+                    "ORG_ID_MISSING"
+                )
             else:
-                org_id = org_mapping.get("org_id")
+                org_id = org_mapping.get(
+                    "org_id"
+                )
 
-            normalized_dob, dob_error = _normalize_date_for_migration(
+            (
+                normalized_dob,
+                dob_error,
+            ) = _normalize_date_for_migration(
                 dob,
                 date_policy,
                 date_assessment_lookup,
             )
 
             if dob_error:
-                reasons.append(dob_error)
+                reasons.append(
+                    dob_error
+                )
 
             if reasons:
+                rejected_row = {
+                    "SOURCE_ROW":
+                        row_number,
+                    "EMP_CODE":
+                        emp_code,
+                    "FULL_NAME":
+                        full_name,
+                    "DOB":
+                        dob,
+                    "DEPARTMENT":
+                        department,
+                    "REJECTION_REASON":
+                        "|".join(reasons),
+                }
+
                 rejected_rows.append(
+                    rejected_row
+                )
+
+                key = (
+                    _make_row_idempotency_key(
+                        job_id,
+                        row_number,
+                        emp_code,
+                        "REJECTED",
+                    )
+                )
+
+                row_ledger_entries.append(
                     {
-                        "SOURCE_ROW": row_number,
-                        "EMP_CODE": emp_code,
-                        "FULL_NAME": full_name,
-                        "DOB": dob,
-                        "DEPARTMENT": department,
-                        "REJECTION_REASON": "|".join(reasons),
+                        "idempotency_key":
+                            key,
+                        "source_row":
+                            row_number,
+                        "emp_code":
+                            emp_code,
+                        "result_type":
+                            "REJECTED",
+                        "payload":
+                            rejected_row,
                     }
                 )
                 continue
 
+            migrated_row = {
+                "employee_code":
+                    emp_code,
+                "full_name":
+                    full_name,
+                "date_of_birth":
+                    normalized_dob,
+                "org_id":
+                    int(org_id),
+            }
+
             migrated_rows.append(
+                migrated_row
+            )
+
+            key = _make_row_idempotency_key(
+                job_id,
+                row_number,
+                emp_code,
+                "MIGRATED",
+            )
+
+            row_ledger_entries.append(
                 {
-                    "employee_code": emp_code,
-                    "full_name": full_name,
-                    "date_of_birth": normalized_dob,
-                    "org_id": int(org_id),
+                    "idempotency_key":
+                        key,
+                    "source_row":
+                        row_number,
+                    "emp_code":
+                        emp_code,
+                    "result_type":
+                        "MIGRATED",
+                    "payload":
+                        migrated_row,
                 }
             )
 
     result = {
-        "status": "TRANSFORMATION_COMPLETED",
-        "date_policy": date_policy,
-        "source_file": source_file_path,
-        "source_file_info": file_info,
-        "source_row_count": len(migrated_rows) + len(rejected_rows),
-        "migrated_row_count": len(migrated_rows),
-        "rejected_row_count": len(rejected_rows),
-        "migrated_rows": migrated_rows,
-        "rejected_rows": rejected_rows,
+        "status":
+            "TRANSFORMATION_COMPLETED",
+        "migration_job_id":
+            job_id,
+        "input_fingerprints":
+            fingerprints,
+        "date_policy":
+            date_policy,
+        "source_file":
+            source_file_path,
+        "source_file_info":
+            file_info,
+        "source_row_count":
+            len(migrated_rows)
+            + len(rejected_rows),
+        "migrated_row_count":
+            len(migrated_rows),
+        "rejected_row_count":
+            len(rejected_rows),
+        "migrated_rows":
+            migrated_rows,
+        "rejected_rows":
+            rejected_rows,
+        "row_ledger_entries":
+            row_ledger_entries,
     }
 
     return Event(output=result)
 
 
-def write_migration_output(node_input: dict):
-    """Write transformed and rejected records to deterministic local artifacts."""
-    if node_input.get("status") == "SOURCE_SCHEMA_ERROR":
+
+def _atomic_write_csv(
+    final_path: str,
+    fieldnames: list,
+    rows: list,
+):
+    """
+    Write to a temporary file in the same directory, then atomically replace
+    the destination. A crash never leaves a half-written final CSV.
+    """
+    output_dir = os.path.dirname(
+        final_path
+    )
+
+    os.makedirs(
+        output_dir,
+        exist_ok=True,
+    )
+
+    fd, temp_path = tempfile.mkstemp(
+        prefix=".schemapilot-",
+        suffix=".tmp",
+        dir=output_dir,
+        text=True,
+    )
+
+    os.close(fd)
+
+    try:
+        with open(
+            temp_path,
+            "w",
+            encoding="utf-8-sig",
+            newline="",
+        ) as f:
+            writer = csv.DictWriter(
+                f,
+                fieldnames=fieldnames,
+                extrasaction="ignore",
+            )
+
+            writer.writeheader()
+            writer.writerows(rows)
+
+        os.replace(
+            temp_path,
+            final_path,
+        )
+
+    finally:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+
+
+def write_migration_output(
+    node_input: dict
+):
+    """
+    Idempotent external write.
+
+    ADK resumability is at-least-once for tool/effect execution, so this node
+    must tolerate being executed more than once. A stable migration_job_id and
+    SQLite ledger prevent duplicate side effects.
+    """
+    if (
+        node_input.get("status")
+        == "SOURCE_SCHEMA_ERROR"
+    ):
         return Event(output=node_input)
 
-    project_root = os.path.dirname(
-        os.path.dirname(__file__)
+    job_id = node_input[
+        "migration_job_id"
+    ]
+
+    fingerprints = node_input.get(
+        "input_fingerprints",
+        {},
     )
 
     output_dir = os.path.join(
-        project_root,
+        PROJECT_ROOT,
         "migration_output",
+        job_id,
     )
-    os.makedirs(output_dir, exist_ok=True)
+
+    os.makedirs(
+        output_dir,
+        exist_ok=True,
+    )
 
     migrated_path = os.path.join(
         output_dir,
         "migrated_employees.csv",
     )
+
     rejected_path = os.path.join(
         output_dir,
         "rejected_rows.csv",
     )
 
-    migrated_fields = [
-        "employee_code",
-        "full_name",
-        "date_of_birth",
-        "org_id",
-    ]
+    conn = _open_ledger()
 
-    with open(
-        migrated_path,
-        "w",
-        encoding="utf-8-sig",
-        newline="",
-    ) as f:
-        writer = csv.DictWriter(
-            f,
-            fieldnames=migrated_fields,
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+
+        existing = conn.execute(
+            """
+            SELECT
+                status,
+                migrated_output_path,
+                rejected_output_path
+            FROM migration_jobs
+            WHERE job_id = ?
+            """,
+            (job_id,),
+        ).fetchone()
+
+        if existing:
+            (
+                existing_status,
+                existing_migrated_path,
+                existing_rejected_path,
+            ) = existing
+
+            terminal = (
+                existing_status
+                not in {
+                    "WRITING",
+                    "OUTPUT_WRITTEN",
+                }
+            )
+
+            outputs_exist = (
+                existing_migrated_path
+                and os.path.exists(
+                    existing_migrated_path
+                )
+                and existing_rejected_path
+                and os.path.exists(
+                    existing_rejected_path
+                )
+            )
+
+            if (
+                terminal
+                and outputs_exist
+            ):
+                conn.commit()
+
+                return Event(
+                    output={
+                        **node_input,
+                        "status":
+                            "IDEMPOTENT_REPLAY_SKIPPED",
+                        "idempotent_replay":
+                            True,
+                        "migrated_output_path":
+                            existing_migrated_path,
+                        "rejected_output_path":
+                            existing_rejected_path,
+                        "migration_ledger_path":
+                            MIGRATION_LEDGER_PATH,
+                    }
+                )
+
+        now = _utc_now()
+
+        conn.execute(
+            """
+            INSERT INTO migration_jobs (
+                job_id,
+                status,
+                source_file,
+                source_sha256,
+                date_policy,
+                created_at,
+                updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(job_id) DO UPDATE SET
+                status = excluded.status,
+                updated_at = excluded.updated_at
+            """,
+            (
+                job_id,
+                "WRITING",
+                node_input.get(
+                    "source_file",
+                    "",
+                ),
+                fingerprints.get(
+                    "source_sha256",
+                    "",
+                ),
+                node_input.get(
+                    "date_policy",
+                    "",
+                ),
+                now,
+                now,
+            ),
         )
-        writer.writeheader()
-        writer.writerows(
-            node_input.get("migrated_rows", [])
+
+        for entry in node_input.get(
+            "row_ledger_entries",
+            [],
+        ):
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO
+                migration_rows (
+                    idempotency_key,
+                    job_id,
+                    source_row,
+                    emp_code,
+                    result_type,
+                    payload_json,
+                    created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    entry[
+                        "idempotency_key"
+                    ],
+                    job_id,
+                    int(
+                        entry["source_row"]
+                    ),
+                    entry.get(
+                        "emp_code",
+                        "",
+                    ),
+                    entry[
+                        "result_type"
+                    ],
+                    json.dumps(
+                        entry["payload"],
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    ),
+                    now,
+                ),
+            )
+
+        migrated_fields = [
+            "employee_code",
+            "full_name",
+            "date_of_birth",
+            "org_id",
+        ]
+
+        rejected_fields = [
+            "SOURCE_ROW",
+            "EMP_CODE",
+            "FULL_NAME",
+            "DOB",
+            "DEPARTMENT",
+            "REJECTION_REASON",
+        ]
+
+        _atomic_write_csv(
+            migrated_path,
+            migrated_fields,
+            node_input.get(
+                "migrated_rows",
+                [],
+            ),
         )
 
-    rejected_fields = [
-        "SOURCE_ROW",
-        "EMP_CODE",
-        "FULL_NAME",
-        "DOB",
-        "DEPARTMENT",
-        "REJECTION_REASON",
-    ]
-
-    with open(
-        rejected_path,
-        "w",
-        encoding="utf-8-sig",
-        newline="",
-    ) as f:
-        writer = csv.DictWriter(
-            f,
-            fieldnames=rejected_fields,
-        )
-        writer.writeheader()
-        writer.writerows(
-            node_input.get("rejected_rows", [])
+        _atomic_write_csv(
+            rejected_path,
+            rejected_fields,
+            node_input.get(
+                "rejected_rows",
+                [],
+            ),
         )
 
-    result = {
-        **node_input,
-        "status": "MIGRATION_OUTPUT_WRITTEN",
-        "migrated_output_path": migrated_path,
-        "rejected_output_path": rejected_path,
-    }
+        conn.execute(
+            """
+            UPDATE migration_jobs
+            SET
+                status = ?,
+                migrated_output_path = ?,
+                rejected_output_path = ?,
+                updated_at = ?
+            WHERE job_id = ?
+            """,
+            (
+                "OUTPUT_WRITTEN",
+                migrated_path,
+                rejected_path,
+                _utc_now(),
+                job_id,
+            ),
+        )
 
-    return Event(output=result)
+        conn.commit()
+
+    except Exception:
+        conn.rollback()
+        raise
+
+    finally:
+        conn.close()
+
+    return Event(
+        output={
+            **node_input,
+            "status":
+                "MIGRATION_OUTPUT_WRITTEN",
+            "idempotent_replay":
+                False,
+            "migrated_output_path":
+                migrated_path,
+            "rejected_output_path":
+                rejected_path,
+            "migration_ledger_path":
+                MIGRATION_LEDGER_PATH,
+        }
+    )
+
 
 
 def verify_migration(node_input: dict):
@@ -1311,6 +1895,21 @@ def verify_migration(node_input: dict):
 
     report = {
         "status": final_status,
+        "migration_job_id":
+            node_input.get(
+                "migration_job_id"
+            ),
+        "idempotent_replay":
+            bool(
+                node_input.get(
+                    "idempotent_replay",
+                    False,
+                )
+            ),
+        "migration_ledger_path":
+            node_input.get(
+                "migration_ledger_path"
+            ),
         "migration_successful":
             migration_successful,
         "source_rows": source_count,
@@ -1336,11 +1935,20 @@ def verify_migration(node_input: dict):
             ),
     }
 
+    job_id = node_input.get(
+        "migration_job_id"
+    )
+
     output_dir = os.path.join(
         project_root,
         "migration_output",
+        job_id,
     )
-    os.makedirs(output_dir, exist_ok=True)
+
+    os.makedirs(
+        output_dir,
+        exist_ok=True,
+    )
 
     report_path = os.path.join(
         output_dir,
@@ -1360,6 +1968,32 @@ def verify_migration(node_input: dict):
         )
 
     report["report_path"] = report_path
+
+    if job_id:
+        conn = _open_ledger()
+
+        try:
+            conn.execute(
+                """
+                UPDATE migration_jobs
+                SET
+                    status = ?,
+                    report_path = ?,
+                    updated_at = ?
+                WHERE job_id = ?
+                """,
+                (
+                    final_status,
+                    report_path,
+                    _utc_now(),
+                    job_id,
+                ),
+            )
+
+            conn.commit()
+
+        finally:
+            conn.close()
 
     return Event(
         output=report,
